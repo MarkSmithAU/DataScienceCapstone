@@ -1,0 +1,280 @@
+---
+title: "Coursera Data Science Capstone Final Report"
+author: "Mark Smith"
+date: "2nd December 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+This report covers the development of the text prediction application for the Coursera / Johns Hopkins University Data Science Specialisation Capstone Project.
+
+# The Data
+Three sets of corpora have been supplied (blogs, news, twitter) in four different languages.  The total of all the sets as text files is approximately 1.3 gigabytes, of which the English-US dataset is 556 megabytes.
+
+The loader code was written to handle multiple languages, but due to processing time constraints only English (en_US) is considered in the final application.  The author only speaks English fluently, so there would be limited ability to perform an accurate analysis of results for other languages.
+
+Manual caching was used extensively through this document on a per-object basis to reduce memory usage and report generation time.  Knitr automatic caching failed to work properly due to the amount of memory in use at times (20Gb+).
+
+## Loading and Cleansing
+Manual inspection of the files indicated they appeared to be encoded with the common UTF-8 encoding.  A procedure was developed to automatically load and the files in allowing for simple file loading.  The files are read in chunks of lines to allow for fast block based IO and then processed in sets, and then all the data is combined into a data frame and returned for further use.  Binary mode was required to load the files correctly as one of them failed to load properly in ascii mode.
+
+It should be noted that the function compiler in R was tested during development to try to improve performance, but it had very little effect on the code here so it was removed to simplify the code.
+
+
+### Line Counts
+```{r statsGen, echo=FALSE} 
+# Use a common cache directory on the build system
+cacheDir <- paste0(getwd(), "/../../cache")
+filepath <- ""
+if (file.exists(cacheDir)) {
+        filepath <- cacheDir
+}
+
+library(knitr)
+
+kable(readRDS(paste0(filepath, "/allDataLineCounts.rds")))
+```
+
+### Line Lengths
+```{r statsSpec, echo=FALSE}
+readRDS(paste0(filepath, "/allDataLineLength.rds"))
+```
+We can see that lines are predominantly only a few hundred characters long but they can be much longer, although this will not matter once the strings are turned into sentences for tokenisation. 
+
+## Cleansing
+Regexes are used to remove unwanted data from the set before tokenisation.  These include:
+
+- A list of profanity words was generated from sources on the internet.  The following procedure reads files in (multiple languages, if supplied) with one word per line, and then dynamically generates a regex for each language and applies it to the dataset.
+
+- Many items that that were deemed to provide no to minimal prediction value: Twitter Hashtags, Email addresses, URLs, Numbers and Punctuation (excluding periods) .
+
+These have been removed here so that this will only have to be done once and it can be left out of the Quanteda processing which some have reported as being slow to perform this particular processing.
+
+### Word Counts 
+These are the wordcounts for the corpora after filtering:
+``` {r wordCounts, echo=FALSE}
+kable(readRDS(paste0(filepath, "/wordCounts.rds")))
+```
+
+## Ngram generation and statistics
+Quanteda [3] was chosen as the package to use for ngram generation as it provides comprehensive support, a good workflow and was shown to provide good performance.
+
+Research into NLP indicates that predictions are usually context/medium sensitive i.e. a prediction from a corpus of twitter text is likely to yield a different result to that of a prediction from news articles, so each source will be considered as a different corpus and analysed separately.
+
+### Histogram of Frequencies
+We can now see the plots of the top {2,3,4}-grams for each set:
+``` {r ngramPlots, echo=FALSE}
+print(readRDS(paste0(filepath, "/pb2.rds")))
+print(readRDS(paste0(filepath, "/pn2.rds")))
+print(readRDS(paste0(filepath, "/pt2.rds")))
+print(readRDS(paste0(filepath, "/pb3.rds")))
+print(readRDS(paste0(filepath, "/pn3.rds")))
+print(readRDS(paste0(filepath, "/pt3.rds")))
+print(readRDS(paste0(filepath, "/pb4.rds")))
+print(readRDS(paste0(filepath, "/pn4.rds")))
+print(readRDS(paste0(filepath, "/pt4.rds")))
+```
+
+The results of these seem reasonable to the author: there is some cross-over but distinct differences such as news articles prominintely featuring "according to the" and "said in a statement" which are more formal, but these do not feature in the blog and Twitter datasets.
+
+From this point on in processing, the {2,3,4}-grams are split into the base which is n-1 words, and the tail which is the last word.
+
+# Conscious Design Choices
+## Stop Word Handling
+There is a choice to be made considering the removal of stop words (i.e. and, the, it, of, etc.).  There are up and downsides to either approach, depending on the objective.
+
+If the objective was to detect the complete meaning of sentences and get a better understanding of context, stop word removal could be quite benefical as a simple method of removing what effecitvely would be noise (assuming a more complex approach was not being used such as part of sentence tagging to differentiate word types).
+
+In the case of this system the objective is to predict the next word, which going by the ngram frequencies is highly likely to be a stop word or include a stop word.  In this context it makes much more sense to leave stop words in the corproa so that they will be predicted along with other words.
+
+## Start and End of Sentence Tagging
+It is common to use tags in the corpora to allow finer grained prediction for phrases at the start of the sentence, while an end of sentence tag can also be included it is likely to provide less value as english has a very flexible sentence structure which means that different authors are likely to write short concise sentences that would make it easy to predict an end of sentence,  while others are likely to write very long conjoined sentences to explain a complex concept (this paragraph is a case in point!).
+
+There is also a resource trade-off inherent to including these markers, as they need to be stored and handled by the algorithm.  In the case of the target application there is a very limited amount of resources available (particularly memory), so the space used by these entries is better put towards including less-common ngrams to ensure that less-common ngrams can be included to increase the chance of a prediction being returned.  
+
+## Contractions
+English has the somewhat complex concept of contractions such as I'd (I would), You've (you have), She's (she has, she is), I'd've (usually used in spoken language: I would have).  This is a complex topic to cover as there is a large list of possible values, and not all of them are unambiguous.  Checking the Google Ngram Viewer [9] indicates that Google has chosen to split the later part of the contraction and treat it as a separate distinct word.  Due to data processing time available and the complexities of this topic, the initial version of the application strips out all apostrophies so contractions such as I'd will be treated as Id.  This is not ideal but it is a known outcome and the same processing logic is used on the query string in the application, so a query with a contraction will find a match if it was in the training data.
+
+# Algorithm & Calculation of Probabilities
+The Katz backoff algorithm [4,5,6] with Good-Turing [7,8] discounting and scaling (a variation of linear interpolation) was chosen as the algorithm for this inital version of the prediction application.  This presents some challenges to allow for both accurate and wide-ranging prediction as well as the calculation of accurate probabilities.  This arises due to the following chain of calculations:
+
+- Initially the frequencies of the ngrams are calculated.
+
+- The discount for the ngram frequencies is calculated using the ratio of the nth and n+1th ngram frequencies.
+
+- The probabilities are calculated for each ngram base and the relative tail.
+
+- The data set is filtered to reduce the volume of ngrams that are required as it is prohibitively large.  This filtering is done on the frequencies of the data.
+
+    - As a side note, a data set of just under 400Mb was able to be loaded, but a set around 600Mb crashed the application on the shiny platform with an out-of-memory error.
+
+- At this point the data is packaged into data.table objects to be loaded into the shiny platform.
+
+- The shiny application uses the data sets and performs the backoff algorithm to find the probability of trigrams, then bigrams and finally unigrams.
+
+    - For the trigrams, the highest probability match is used then multiplied by the user supplied scaling factor.
+
+    - For bigrams the discounted backed-off probability is used, combined with the scaling factor.  If no backed-off probability is available from the trigram then it is considered to be 1.
+
+    - The probability of the bigrams is now recalculated, excluding the tails that were in the trigram backoff list.
+
+        - Note that as the data was filtered previously, we do not have a true count remaining of anything that was filtered out.
+
+    - Any results are added to the list.
+
+    - Unigram processing is now performed in the same manner as for bigrams except tails from both trigrams and bigrams are excluded.
+
+    - The entire result set is sorted by the most likely probability.
+
+    - The requested number of results with the highest probability are returned to the application.
+
+
+So while a best-effort is made to calculate the correct probabilites, there will be some inaccuracies introduced by the backoff calculation due to the missing data that has been necessarily excluded from the final application.
+
+# Implementation
+The system has been implemented like so:
+
+- A main build script that generates the main data sets for the application and reports.
+
+- A second build script specifically to generate results assosciated with testing the application's performance.
+
+- The prediction application comprised of nine data.table objects and two R files totalling 370Mb (62Mb gzip compressed for the upload).
+
+
+# Testing
+Unfortunately due to resource constraints, a full cross-validation was ruled out (a full build took around six hours, k-fold cross validation with a full dataset would have taken far longer than the time available).
+
+As a proxy for assessing the probabilities, the coverage of the predicition set vs the full data set used for training has been assessed, as well as ability of the algorithm to predict the answers of the quiz questions.
+
+## Coverage Percentages
+In the following tables, the following terminologies are used:
+
+- Selected: The entries that have been chosen at that ngram level as the highest probability.
+
+- Unselected: The entries that were not ranked first.  In the case {1,2}grams they can still be used if chosen by the backoff algorithm.
+
+Firstly, the data for the full prediction set:
+``` {r coverageFull, echo=FALSE}
+kable(readRDS(paste0(filepath, "/coverageFullSet.rds")))
+```
+
+Secondly, the data for the cut-down prediction set used in the application:
+``` {r coveragePrediction, echo=FALSE}
+kable(readRDS(paste0(filepath, "/coveragePredictionSet.rds")))
+```
+
+Now we compare the percentage of coverage given by the cut-down prediction set against the full prediction set: 
+``` {r coverageCompare, echo=FALSE}
+kable(readRDS(paste0(filepath, "/coverageChangeSummary.rds")))
+```
+
+We can see that while the precentage by frequency values, which are the most relevant for maximum likelihood prediction have decreased, they are still have reasonable coverage at with the PercentByFreq values being (14%, 14%, 7%) +- 1% for (2,3,4)-grams across all corpora.
+
+## Tests against Quiz data sets
+As observed previously, the algorithm for the prediction needs to choose between providing a next word for a sentence (including stopwords) as well as less common words that are actually providing meaning.  With the current algorithm it was not possible to achieve both goals, so the focus was on the next word alone.
+
+The quiz results were compiled into a dataset and tested against the above algorithm with an unmodified scaling factor of 1.  The algorithm as described above was then run over these sets with each corpora to determine if it would choose the correct word as the top prediction.  We can see from the results below that only a few of the results do match the correct answer, with the incorrect answer sometimes sounding more likely to a native english speaker than the actual stated correct answer!  When checking the quiz results earlier in the course, if the set of possible results was constrained by the multiple choice answers, the results were unsurprisingly far more likely to return the correct result out of the set, but not always.
+
+In this table we can see the counts of answers that were returned by the algorithm that were considered correct:
+``` {r quizResults1, echo=FALSE}
+predictionFullSetSummary <- readRDS(paste0(filepath, "/predictionFullSetSummary.rds"))
+kable(predictionFullSetSummary)
+predictionFullSetSummaryCc<- sum(predictionFullSetSummary$CorrectCount)
+```
+
+Now we check if the result was 'just missed' by seeing if the result was in the top 20 returned:
+``` {r quizResults2, echo=FALSE}
+predictionFullSetExtendedMatchSummary <- readRDS(paste0(filepath, "/predictionFullSetExtendedMatchSummary.rds"))
+kable(predictionFullSetExtendedMatchSummary)
+predictionFullSetExtendedMatchSummaryCc<- sum(predictionFullSetExtendedMatchSummary$ContainsCount)
+```
+
+So we can see that out of a possible 60 correct results there were `r predictionFullSetExtendedMatchSummaryCc` correct results from the top 20 vs `r predictionFullSetSummaryCc` from the single top result.
+
+The next verification is to see how this holds up once the data set size is reduced:
+``` {r quizResults3, echo=FALSE}
+predictionMatchSummary <- readRDS(paste0(filepath, "/predictionMatchSummary.rds"))
+kable(predictionMatchSummary)
+predictionMatchSummaryCc<- sum(predictionMatchSummary$CorrectCount)
+```
+
+Now we check if the result was 'just missed' by seeing if the result was in the top 20 returned:
+``` {r quizResults4, echo=FALSE}
+predictionExtendedMatchSummary <- readRDS(paste0(filepath, "/predictionExtendedMatchSummary.rds"))
+kable(predictionExtendedMatchSummary)
+predictionExtendedMatchSummaryCc<- sum(predictionExtendedMatchSummary$ContainsCount)
+```
+
+So we can see that out of a possible 60 correct results there were `r predictionExtendedMatchSummaryCc` correct results from the top 20 vs `r predictionMatchSummaryCc` from the single top result.
+
+So reducing the data size from approximately 8.15Gb to 0.37Gb (4.5% of the original size) of data.table objects, our prediction accuracy went from `r predictionFullSetSummaryCc/60` to `r predictionMatchSummaryCc/60` percent, which is only a 5% decrease in accuracy for a 95% / 22-fold reduction in the data size.
+
+# Challenges faced during development
+- The primary challenge during research and development was the high memory requirement for generation and processing of the ngrams.  The strategy taken (as shown in the code) was to work on discrete chunks of data, cache the results and then remove the objects in R.  This does not return most of the allocated memory to the operating system, but it can be re-used within the R session.
+
+- The volume of data necessitated sampling for early development (where practical) but it appeared that with some of the data highlighted in the quizzes, if sampling had been used there would have been no chance of predicting the answers, so full processing was required.  This frustrated attempts to consider different approaches within the time available.
+
+# Conclusion
+The application shows promise for performing simple predictions and does perform quite well in terms of predicting the next 'common' word, and during testing, if it was fed the last word predicted the sentence sounded gramatically parsable for some time, although it lacked meaning quite quickly.
+
+The limited resources available for the final application have necessitated a heavily reduced data set which did reduce the accuracy of the redictions from 21% to 16%.  In a real world use case this may not be as importand as it would have been ten years ago: a large number of people have internet-connected devices which can rapidly query a much more complete predction system online, and only fall back to a smaller on-device prediction model when there are connectivity issues.
+
+The application could be significantly enhanced if some options were explored:
+
+- A full test with cross-validation.
+
+- Testing a combination of probabilities with a prediction set with stop words removed, combined with the current proediction set to try and get words from further back in sentences, which would likely enhance meaning and the results.  This might require part-of-speech tagging which is a far more advanced topic.
+
+- Including start of sentence and end of sentence tagging.
+
+- Handling contractions correctly either by expansion or an extension of the technique Google uses in the Ngram Viewer [10].
+
+- Implementing a more advanced model for probabilities such as Kneser-Ney Smoothing [11].
+
+
+# Links
+
+Pitch Presentation <http://rpubs.com/MarkSmithAU/CapstonePitch>
+
+GitHub Repository <https://github.com/MarkSmithAU/DataScienceCapstone>
+
+This Report <http://rpubs.com/MarkSmithAU/CapstoneReport>
+
+
+# References / Research (in no particular order)
+1. Capstone <http://datasciencespecialization.github.io/capstone/>
+
+2. Capstone hints <https://github.com/lgreski/datasciencectacontent/blob/master/markdown/capstone-ngramComputerCapacity.md>
+
+3. Quanteda <https://tutorials.quanteda.io/>
+
+4. Katz Backoff Model Paper <http://l2r.cs.uiuc.edu/~danr/Teaching/CS546-09/Papers/Katz87.pdf>
+
+5. Katz Backoff Model in R <https://thachtranerc.wordpress.com/2016/04/12/katzs-backoff-model-implementation-in-r/>
+
+6. Katz Backoff Model <https://en.wikipedia.org/wiki/Katz's_back-off_model>
+
+7. Good-Turing Example <https://rstudio-pubs-static.s3.amazonaws.com/165358_78fd356d6e124331bd66981c51f7ad7c.html>
+
+8. Good-Turing Method <https://en.wikipedia.org/wiki/Good%E2%80%93Turing_frequency_estimation>
+
+9. Speech and Language Processing <https://web.stanford.edu/%7Ejurafsky/slp3/>
+
+10. Google Ngram Viewer <https://books.google.com/ngrams>
+
+11. Kneser-Ney Smoothing <https://en.wikipedia.org/wiki/Kneser%E2%80%93Ney_smoothing>
+
+# System Specifications
+Hardware: i7-3770K @ 4.4GHz
+
+RAM: 32GB
+
+Disk: SSD
+
+OS: Windows 10 x64
+
+R: Version 3.5.1
